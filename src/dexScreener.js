@@ -9,37 +9,125 @@ class DexScreener {
         this.maxPairAge = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
         this.idealVolumeToLiquidityRatio = 3; // Ideal daily volume should be 3x liquidity
         this.maxPriceChangeScore = 3; // Cap price change contribution to score
+        this.searchQueries = [
+            'solana memecoin',
+            'solana new',
+            'pump solana',
+            'raydium new',
+            'orca new token',
+            'jupiter new'
+        ];
+        this.dexes = [
+            'raydium', 
+            'orca', 
+            'jupiter',
+            'meteora',
+            'cykura',
+            'saros',
+            'step',
+            'cropper',
+            'lifinity'
+        ];
+        this.lastSearchIndex = 0;
+        this.lastSearchTime = 0;
+        this.searchInterval = 60000; // 1 minute between searches
+        this.maxPages = 3; // Fetch up to 3 pages per DEX
     }
 
     async searchMemecoins() {
         try {
             logger.deep('Initiating memecoin search on DEX Screener');
-            const response = await axios.get(`${this.baseUrl}/search`, {
-                params: {
-                    q: 'solana memecoin'
-                }
-            });
-
-            if (!response.data || !Array.isArray(response.data.pairs)) {
-                throw new Error('Invalid response format from DEX Screener');
+            
+            // Rotate through search queries
+            const currentTime = Date.now();
+            if (currentTime - this.lastSearchTime < this.searchInterval) {
+                this.lastSearchIndex = (this.lastSearchIndex + 1) % this.searchQueries.length;
             }
+            this.lastSearchTime = currentTime;
 
-            const currentTime = new Date().getTime();
-            const solanaPairs = response.data.pairs.filter(pair => {
+            // Select 3 random DEXes to search
+            const selectedDexes = this.dexes
+                .sort(() => Math.random() - 0.5)
+                .slice(0, 3);
+
+            // Make multiple searches in parallel
+            const searchPromises = [
+                // Search by current query
+                this.searchByQuery(this.searchQueries[this.lastSearchIndex]),
+                // Search on multiple DEXes
+                ...selectedDexes.map(dex => this.searchByDex(dex))
+            ];
+
+            const results = await Promise.all(searchPromises);
+            const allPairs = results.flat().filter(Boolean);
+
+            // Deduplicate pairs by base token address
+            const uniquePairs = Array.from(
+                new Map(allPairs.map(pair => [pair.baseToken?.address, pair])).values()
+            );
+
+            // Apply filters with slightly relaxed criteria for new tokens
+            const filteredPairs = uniquePairs.filter(pair => {
                 if (!pair.chainId || !pair.liquidity?.usd || !pair.pairCreatedAt) {
                     return false;
                 }
 
-                const pairAge = currentTime - new Date(pair.pairCreatedAt).getTime();
+                const pairAge = Date.now() - new Date(pair.pairCreatedAt).getTime();
                 return pair.chainId === 'solana' &&
-                       pair.liquidity.usd >= this.minLiquidity &&
+                       ((pair.liquidity.usd >= this.minLiquidity) || 
+                        (pairAge <= 24 * 60 * 60 * 1000 && pair.liquidity.usd >= this.minLiquidity / 2)) && // Lower liquidity requirement for new tokens
                        pairAge <= this.maxPairAge;
             });
 
-            logger.deep(`Found ${solanaPairs.length} Solana pairs matching initial criteria`);
-            return solanaPairs;
+            logger.deep(`Found ${filteredPairs.length} unique Solana pairs matching criteria from ${selectedDexes.join(', ')}`);
+            return filteredPairs;
         } catch (error) {
             logger.error(`DEX Screener search failed: ${error.message}`);
+            return [];
+        }
+    }
+
+    async searchByQuery(query, page = 1) {
+        try {
+            const response = await axios.get(`${this.baseUrl}/search`, {
+                params: {
+                    q: query,
+                    page
+                }
+            });
+
+            return response.data?.pairs || [];
+        } catch (error) {
+            logger.error(`Query search failed for "${query}": ${error.message}`);
+            return [];
+        }
+    }
+
+    async searchByDex(dex) {
+        try {
+            const allPairs = [];
+            
+            // Fetch multiple pages in parallel
+            const pagePromises = Array.from({ length: this.maxPages }, (_, i) => 
+                axios.get(`${this.baseUrl}/pairs/solana/${dex}`, {
+                    params: { page: i + 1 }
+                }).catch(error => {
+                    logger.error(`Failed to fetch page ${i + 1} for ${dex}: ${error.message}`);
+                    return { data: { pairs: [] } };
+                })
+            );
+
+            const responses = await Promise.all(pagePromises);
+            responses.forEach(response => {
+                if (response.data?.pairs) {
+                    allPairs.push(...response.data.pairs);
+                }
+            });
+
+            logger.deep(`Found ${allPairs.length} pairs on ${dex}`);
+            return allPairs;
+        } catch (error) {
+            logger.error(`DEX search failed for "${dex}": ${error.message}`);
             return [];
         }
     }
