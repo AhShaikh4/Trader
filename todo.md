@@ -27,8 +27,8 @@
   - [x] Implement historical price tracking
   - [x] Add liquidity verification
 - [ ] Add Jupiter Swap integration
-- [ ] Create token discovery logic
-- [ ] Implement token analysis system
+- [x] Create token discovery logic
+- [x] Implement token analysis system
 - [ ] Add trade amount calculator
 - [ ] Create trading execution system
 
