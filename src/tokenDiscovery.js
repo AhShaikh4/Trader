@@ -1,180 +1,235 @@
-const dexScreener = require('./dexScreener');
+const bitqueryApi = require('./bitqueryApi');
+const jupiterApi = require('./jupiterApi');
 const birdeyeApi = require('./birdeyeApi');
-const config = require('./config');
 const logger = require('./logger');
+const config = require('./config');
 
 class TokenDiscovery {
     constructor() {
-        this.minLiquidity = config.MIN_LIQUIDITY_USD || 10000; // Default $10k min liquidity
         this.discoveryCache = new Map();
         this.lastScanTime = 0;
-        this.scanInterval = config.TRADE_INTERVAL_MS || 30000; // Reduced to 30 seconds for testing
-        this.maxCacheAge = 60000; // Cache valid for 1 minute
+        this.scanInterval = config.TRADE_INTERVAL_MS || 30000;
+        this.maxCacheAge = 60000;
+        this.activeAnalyses = new Set();
     }
 
-    async findTradingOpportunities(forceFresh = false) {
+    async start() {
+        logger.high('Starting token discovery system');
+        
+        // Start Bitquery token discovery subscription
+        this.discoverySubscription = await bitqueryApi.startTokenDiscovery(
+            async (token) => this.processNewToken(token)
+        );
+
+        return () => this.cleanup();
+    }
+
+    async processNewToken(token) {
         try {
-            logger.high('Starting token discovery scan');
+            if (this.discoveryCache.has(token.MintAddress)) {
+                return;
+            }
+
+            logger.deep(`Processing new token: ${token.Symbol} (${token.MintAddress})`);
+
+            // Check liquidity on DEXes
+            const liquidityInfo = await bitqueryApi.checkLiquidityPool(token.MintAddress);
+            if (!liquidityInfo.hasLiquidity) {
+                logger.deep(`${token.Symbol} rejected: Insufficient liquidity ($${liquidityInfo.liquidity})`);
+                return;
+            }
+
+            // Start trade analysis
+            const analysis = await this.analyzeToken(token, liquidityInfo);
             
-            const now = Date.now();
-            const cacheAge = now - this.lastScanTime;
-
-            // Check if we should use cache
-            if (!forceFresh && cacheAge < this.maxCacheAge && this.discoveryCache.size > 0) {
-                logger.deep(`Using cached discovery results (age: ${Math.round(cacheAge / 1000)}s)`);
-                return Array.from(this.discoveryCache.values());
+            if (analysis.isViable) {
+                this.discoveryCache.set(token.MintAddress, analysis);
+                this.activeAnalyses.add(token.MintAddress);
+                
+                // Monitor trades for profit taking
+                this.monitorTokenTrades(token.MintAddress, analysis.entryPrice);
             }
 
-            // Clear cache before new scan
-            this.discoveryCache.clear();
-            logger.deep('Cache cleared, performing fresh token scan');
-
-            // Get initial token list from DEX Screener
-            const pairs = await dexScreener.searchMemecoins();
-            logger.high(`Found ${pairs.length} initial token candidates`);
-
-            const opportunities = [];
-            for (const pair of pairs) {
-                const token = pair.baseToken;
-                if (!token || !token.address) continue;
-
-                // Skip if token was recently analyzed and failed
-                if (this.discoveryCache.has(token.address)) {
-                    continue;
-                }
-
-                // Get detailed analysis from both sources
-                const [dexAnalysis, birdeyeAnalysis] = await Promise.all([
-                    dexScreener.analyzeToken(pair),
-                    birdeyeApi.analyzeToken(token.address)
-                ]);
-
-                if (!dexAnalysis || !birdeyeAnalysis) continue;
-
-                // Combine and score the analyses
-                const combinedAnalysis = this.combineAnalyses(token, dexAnalysis, birdeyeAnalysis);
-                
-                // Store in cache regardless of viability
-                this.discoveryCache.set(token.address, combinedAnalysis);
-                
-                if (combinedAnalysis.isViable) {
-                    opportunities.push(combinedAnalysis);
-                }
-            }
-
-            // Sort by combined score
-            opportunities.sort((a, b) => b.combinedScore - a.combinedScore);
-            this.lastScanTime = now;
-
-            logger.high(`Found ${opportunities.length} viable trading opportunities`);
-            return opportunities;
         } catch (error) {
-            logger.error(`Token discovery failed: ${error.message}`);
-            return [];
+            logger.error(`Error processing token ${token.Symbol}: ${error.message}`);
         }
     }
 
-    combineAnalyses(token, dexAnalysis, birdeyeAnalysis) {
+    async analyzeToken(token, liquidityInfo) {
         const analysis = {
-            address: token.address,
-            symbol: token.symbol,
-            price: birdeyeAnalysis.price,
-            liquidity: Math.min(dexAnalysis.liquidity, birdeyeAnalysis.liquidity || 0),
-            volume24h: dexAnalysis.volume24h,
-            priceChange1h: birdeyeAnalysis.priceChange1h,
-            priceChange24h: dexAnalysis.priceChange24h,
-            dexScore: dexAnalysis.score,
-            reasons: [...dexAnalysis.reasons],
-            metrics: {
-                ...dexAnalysis.metrics,
-                priceConsistency: this.calculatePriceConsistency(dexAnalysis.price, birdeyeAnalysis.price)
-            },
-            lastUpdate: birdeyeAnalysis.updateTime
+            address: token.MintAddress,
+            symbol: token.Symbol,
+            name: token.Name,
+            liquidity: liquidityInfo.liquidity,
+            exchanges: liquidityInfo.exchanges,
+            isViable: false,
+            metrics: {},
+            reasons: []
         };
 
-        // Calculate combined score (0-100)
-        analysis.combinedScore = this.calculateCombinedScore(analysis);
-        
-        // Determine if token is viable for trading
-        analysis.isViable = this.isViableForTrading(analysis);
+        try {
+            // Get additional data from Birdeye for cross-validation
+            const birdeyeData = await birdeyeApi.getTokenInfo(token.MintAddress);
+            
+            // Start trade analysis with Bitquery
+            const tradeMetrics = await new Promise((resolve) => {
+                const timeout = setTimeout(() => resolve(null), 30000); // 30s timeout
+                
+                bitqueryApi.startTradeAnalysis(token.MintAddress, (metrics) => {
+                    clearTimeout(timeout);
+                    resolve(metrics);
+                });
+            });
 
-        logger.token(JSON.stringify(analysis, null, 2));
-        return analysis;
+            if (!tradeMetrics) {
+                logger.deep(`${token.Symbol} rejected: No trade activity detected`);
+                return analysis;
+            }
+
+            // Get holder distribution
+            const holders = await bitqueryApi.getHolderDistribution(token.MintAddress);
+            
+            // Combine all metrics
+            analysis.metrics = {
+                priceUSD: tradeMetrics.currentPrice,
+                buySellRatio: tradeMetrics.buySellRatio,
+                uniqueBuyers: tradeMetrics.uniqueBuyerCount,
+                uniqueSellers: tradeMetrics.uniqueSellerCount,
+                totalVolume: tradeMetrics.totalVolume,
+                topHolderCount: holders.length,
+                topHolderBalance: holders[0]?.balance || 0,
+                birdeyePrice: birdeyeData?.price || 0,
+                priceConsistency: this.calculatePriceConsistency(
+                    tradeMetrics.currentPrice,
+                    birdeyeData?.price
+                )
+            };
+
+            // Score the token
+            analysis.combinedScore = this.calculateCombinedScore(analysis);
+            analysis.isViable = this.isViableForTrading(analysis);
+            analysis.entryPrice = tradeMetrics.currentPrice;
+
+            if (analysis.isViable) {
+                logger.high(`Viable token found: ${token.Symbol}`, {
+                    metrics: analysis.metrics,
+                    score: analysis.combinedScore
+                });
+            } else {
+                logger.deep(`${token.Symbol} rejected: Failed viability check`);
+            }
+
+            return analysis;
+
+        } catch (error) {
+            logger.error(`Analysis failed for ${token.Symbol}: ${error.message}`);
+            return analysis;
+        }
     }
 
-    calculatePriceConsistency(dexPrice, birdeyePrice) {
-        if (!dexPrice || !birdeyePrice) return 0;
-        // Allow for larger price differences between sources
-        const deviation = Math.abs(dexPrice - birdeyePrice) / Math.max(dexPrice, birdeyePrice);
-        return Math.max(0, 1 - (deviation * 2)); // More forgiving calculation
+    calculatePriceConsistency(bitqueryPrice, birdeyePrice) {
+        if (!bitqueryPrice || !birdeyePrice) return 0;
+        const deviation = Math.abs(bitqueryPrice - birdeyePrice) / Math.max(bitqueryPrice, birdeyePrice);
+        return Math.max(0, 1 - (deviation * 2));
     }
 
     calculateCombinedScore(analysis) {
         let score = 0;
+        const m = analysis.metrics;
 
-        // Base score from DEX Screener (0-40 points, reduced from 50)
-        score += (analysis.dexScore / 11) * 40;
-
-        // Increased liquidity score (0-25 points, up from 15)
-        if (analysis.liquidity >= this.minLiquidity) {
-            score += Math.min(25, (analysis.liquidity / this.minLiquidity) * 8);
+        // Liquidity score (0-30 points)
+        if (analysis.liquidity >= 10000) {
+            score += Math.min(30, (analysis.liquidity / 10000) * 10);
         }
 
-        // Price momentum score (0-20 points, up from 15)
-        if (analysis.priceChange1h > 0) {
-            score += Math.min(20, analysis.priceChange1h);
+        // Buy/Sell ratio score (0-20 points)
+        if (m.buySellRatio >= 1) {
+            score += Math.min(20, m.buySellRatio * 5);
         }
 
-        // Reduced weight of price consistency (0-5 points, down from 10)
-        score += analysis.metrics.priceConsistency * 5;
+        // Unique traders score (0-20 points)
+        const uniqueTraders = m.uniqueBuyers + m.uniqueSellers;
+        score += Math.min(20, uniqueTraders / 5);
 
-        // Volume to liquidity ratio score (0-10 points, unchanged)
-        const vlRatio = analysis.volume24h / analysis.liquidity;
-        if (vlRatio >= 0.5 && vlRatio <= 5) {
-            score += Math.min(10, vlRatio * 2);
+        // Volume score (0-15 points)
+        if (m.totalVolume >= 5000) {
+            score += Math.min(15, (m.totalVolume / 5000) * 5);
         }
+
+        // Price consistency score (0-15 points)
+        score += m.priceConsistency * 15;
 
         return Math.round(score);
     }
 
     isViableForTrading(analysis) {
-        const viable = analysis.liquidity >= this.minLiquidity &&
-               analysis.combinedScore >= 35 && // Further lowered from 40
-               analysis.metrics.priceConsistency >= 0.85 && // Further lowered from 0.90
-               !this.hasExcessiveVolatility(analysis);
+        const m = analysis.metrics;
+        const viable = 
+            analysis.liquidity >= 10000 &&
+            analysis.combinedScore >= 35 &&
+            m.priceConsistency >= 0.85 &&
+            m.buySellRatio >= 1.2 &&
+            m.uniqueBuyers >= 20;
 
         if (!viable) {
-            logger.deep(`Token ${analysis.symbol} rejected: ` +
-                `Liquidity: ${analysis.liquidity >= this.minLiquidity ? 'Pass' : 'Fail'}, ` +
-                `Score: ${analysis.combinedScore >= 35 ? 'Pass' : 'Fail'}, ` +
-                `Consistency: ${analysis.metrics.priceConsistency >= 0.85 ? 'Pass' : 'Fail'}, ` +
-                `Volatility: ${!this.hasExcessiveVolatility(analysis) ? 'Pass' : 'Fail'}`
-            );
-        } else {
-            logger.deep(`Token ${analysis.symbol} ACCEPTED with metrics: ` +
-                `Liquidity: $${analysis.liquidity.toLocaleString()}, ` +
-                `Score: ${analysis.combinedScore}, ` +
-                `Consistency: ${(analysis.metrics.priceConsistency * 100).toFixed(1)}%, ` +
-                `24h Change: ${analysis.priceChange24h?.toFixed(1)}%`
-            );
+            logger.deep(`${analysis.symbol} viability check failed:`, {
+                liquidity: `${analysis.liquidity >= 10000 ? 'Pass' : 'Fail'} ($${analysis.liquidity})`,
+                score: `${analysis.combinedScore >= 35 ? 'Pass' : 'Fail'} (${analysis.combinedScore})`,
+                consistency: `${m.priceConsistency >= 0.85 ? 'Pass' : 'Fail'} (${(m.priceConsistency * 100).toFixed(1)}%)`,
+                buySellRatio: `${m.buySellRatio >= 1.2 ? 'Pass' : 'Fail'} (${m.buySellRatio.toFixed(2)})`,
+                uniqueBuyers: `${m.uniqueBuyers >= 20 ? 'Pass' : 'Fail'} (${m.uniqueBuyers})`
+            });
         }
 
         return viable;
     }
 
-    hasExcessiveVolatility(analysis) {
-        // More lenient thresholds for volatility
-        const excessive = Math.abs(analysis.priceChange24h) > 2000 || // Increased from 1000
-                         Math.abs(analysis.priceChange1h) > 200;      // Increased from 100
+    monitorTokenTrades(tokenAddress, entryPrice) {
+        bitqueryApi.startTradeAnalysis(tokenAddress, (metrics) => {
+            try {
+                // Check for profit target or stop loss
+                const priceChange = (metrics.currentPrice - entryPrice) / entryPrice;
+                
+                if (priceChange >= 0.10) { // 10% profit target
+                    logger.high(`Profit target reached for ${tokenAddress}`, {
+                        entryPrice,
+                        currentPrice: metrics.currentPrice,
+                        profit: `${(priceChange * 100).toFixed(1)}%`
+                    });
+                    this.stopMonitoring(tokenAddress);
+                }
+                else if (priceChange <= -0.05) { // 5% stop loss
+                    logger.high(`Stop loss triggered for ${tokenAddress}`, {
+                        entryPrice,
+                        currentPrice: metrics.currentPrice,
+                        loss: `${(priceChange * 100).toFixed(1)}%`
+                    });
+                    this.stopMonitoring(tokenAddress);
+                }
+            } catch (error) {
+                logger.error(`Error monitoring ${tokenAddress}: ${error.message}`);
+            }
+        });
+    }
 
-        if (excessive) {
-            logger.deep(`Excessive volatility for ${analysis.symbol}: ` +
-                `24h change: ${analysis.priceChange24h}%, ` +
-                `1h change: ${analysis.priceChange1h}%`
-            );
+    stopMonitoring(tokenAddress) {
+        bitqueryApi.stopTradeAnalysis(tokenAddress);
+        this.activeAnalyses.delete(tokenAddress);
+        logger.deep(`Stopped monitoring ${tokenAddress}`);
+    }
+
+    cleanup() {
+        if (this.discoverySubscription) {
+            this.discoverySubscription.unsubscribe();
         }
-
-        return excessive;
+        
+        for (const tokenAddress of this.activeAnalyses) {
+            this.stopMonitoring(tokenAddress);
+        }
+        
+        this.discoveryCache.clear();
+        bitqueryApi.cleanup();
+        logger.high('Token discovery system cleaned up');
     }
 }
 
