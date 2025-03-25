@@ -26,9 +26,15 @@
   - [x] Test price data retrieval
   - [x] Implement historical price tracking
   - [x] Add liquidity verification
-- [ ] Add Jupiter Swap integration
+- [x] Add Jupiter Swap integration
 - [x] Create token discovery logic
 - [x] Implement token analysis system
+- [ ] Build trading strategy
+  - [ ] Define entry/exit conditions
+  - [ ] Implement position sizing
+  - [ ] Add risk management rules
+  - [ ] Create market sentiment analysis
+  - [ ] Implement stop-loss and take-profit logic
 - [ ] Add trade amount calculator
 - [ ] Create trading execution system
 
