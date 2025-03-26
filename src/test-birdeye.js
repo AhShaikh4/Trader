@@ -6,14 +6,17 @@ async function testBirdeyeApi() {
     logger.high('Starting Birdeye API integration test with multiple tokens');
 
     try {
-        // Get test tokens from DexScreener
-        const pairs = await dexScreener.searchMemecoins();
+        // Get test tokens from DexScreener using getTrendingTokens instead of searchMemecoins
+        const pairs = await dexScreener.getTrendingTokens();
         if (pairs.length === 0) {
             throw new Error('No tokens found via DexScreener to test with');
         }
 
         // Test with first 3 tokens or all if less than 3
-        const testTokens = pairs.slice(0, 3).map(pair => pair.baseToken);
+        const testTokens = pairs.slice(0, 3).map(pair => ({
+            symbol: pair.baseToken.symbol,
+            address: pair.baseToken.address
+        }));
         logger.high(`Found ${testTokens.length} tokens to test with`);
 
         for (const token of testTokens) {

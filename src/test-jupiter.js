@@ -10,8 +10,8 @@ async function testJupiterApi() {
     logger.high('Starting Jupiter API integration test');
 
     try {
-        // Get a test memecoin from DexScreener
-        const pairs = await dexScreener.searchMemecoins();
+        // Get a test memecoin from DexScreener using getTrendingTokens instead of searchMemecoins
+        const pairs = await dexScreener.getTrendingTokens();
         if (pairs.length === 0) {
             throw new Error('No tokens found via DexScreener to test with');
         }
