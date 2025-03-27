@@ -56,3 +56,25 @@
   - Tests for getRecentTokens functionality
   - Tests for applyAgeBuyingCriteria functionality
   - Tests for comprehensive token discovery without search queries
+
+## 2025-03-27: Project Structure Consolidation
+
+- Created `src/traderAPI.js` to consolidate multiple API modules:
+  - Combined functionality from dexScreener.js, birdeyeApi.js, and jupiterApi.js
+  - Integrated Moralis API functionality
+  - Maintained all core features while reducing code duplication
+  - Organized related functionality into a single, comprehensive API module
+  - Implemented consistent error handling and logging across all API functions
+  - Preserved caching and rate limiting mechanisms
+
+- Created consolidated test files:
+  - `src/consolidated-test.js` for testing token discovery functionality
+  - `src/test-consolidated-api.js` for testing the consolidated API module
+
+- Files that can be consolidated or removed:
+  - `src/dexScreener.js` (functionality moved to traderAPI.js)
+  - `src/birdeyeApi.js` (functionality moved to traderAPI.js)
+  - `src/jupiterApi.js` (functionality moved to traderAPI.js)
+  - `src/tokenDiscovery.js` (superseded by mergedTokenDiscovery.js)
+  - `src/optimizedTokenDiscovery.js` (superseded by mergedTokenDiscovery.js)
+  - Multiple test files can be consolidated into the new consolidated test files
