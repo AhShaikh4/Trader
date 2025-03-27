@@ -1,0 +1,43 @@
+# Changes Log
+
+## 2025-03-27: Moralis API Integration for Solana Token Analysis
+
+- Created `moralis-integration.js` with the following functionality:
+  - Implemented initialization with Moralis API key
+  - Added token price endpoint integration
+  - Added OHLCV data endpoint integration
+  - Added token swaps endpoint integration
+  - Added wallet swaps endpoint integration
+  - Added token snipers endpoint integration
+  - Added token metadata endpoint integration
+  - Added wallet balance endpoint integration
+  - Added wallet tokens endpoint integration
+
+- Created `test-moralis.js` to test the implementation:
+  - Successfully tested token price endpoint
+  - Successfully tested token metadata endpoint
+  - Successfully tested wallet balance endpoint
+
+- Dependencies added:
+  - moralis
+  - @moralisweb3/common-sol-utils
+
+## 2025-03-27: Token Info Enhancement with Moralis API
+
+- Created `src/moralisApi.js` to provide Moralis functionality to other components:
+  - Implemented initialization with Moralis API key
+  - Added token metadata retrieval function
+  - Added token price retrieval function
+
+- Enhanced `src/dexScreener.js` with Moralis integration:
+  - Added Moralis initialization handling
+  - Added `getTokenInfo()` method to fetch detailed token information
+  - Added `enhanceTokenData()` method to add Moralis data to token objects
+  - Added `getEnhancedTokenPools()` method to get pools with enhanced token data
+  - Updated `discoverTokens()` method to include Moralis data in discovery results
+
+- Created `src/test-moralis-enhancement.js` to test the enhancements:
+  - Tests for getTokenInfo functionality
+  - Tests for enhanceTokenData functionality
+  - Tests for getEnhancedTokenPools functionality
+  - Tests for enhanced token discovery

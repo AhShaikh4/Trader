@@ -1,5 +1,6 @@
 const axios = require('axios');
 const logger = require('./logger');
+const moralisApi = require('./moralisApi');
 
 class DexScreenerDirect {
     constructor() {
@@ -17,6 +18,17 @@ class DexScreenerDirect {
         this.processingQueue = false;
         this.requestsPerMinute = 250; // Keep below the 300 limit for safety
         this.requestTimestamps = [];
+        
+        // Initialize Moralis
+        this.moralisInitialized = false;
+    }
+
+    // Initialize Moralis if not already initialized
+    async ensureMoralisInitialized() {
+        if (!this.moralisInitialized) {
+            await moralisApi.initMoralis();
+            this.moralisInitialized = true;
+        }
     }
 
     // Rate limiting methods
@@ -351,204 +363,186 @@ class DexScreenerDirect {
         ];
     }
     
-    // Filter pairs based on criteria
-    filterPairs(pairs, strictMode = true) {
-        // Base filtering that applies to all modes
-        let filteredPairs = pairs.filter(pair => {
-            if (!pair.chainId || !pair.liquidity?.usd) {
-                return false;
-            }
-            
-            return pair.chainId === 'solana';
-        });
-        
-        // If we have too few results, use less strict filtering
-        if (filteredPairs.length < 10 && strictMode) {
-            logger.deep(`Few results with strict filtering (${filteredPairs.length}), applying relaxed criteria`);
-            return this.filterPairs(pairs, false);
-        }
-        
-        // Apply liquidity filtering based on mode
-        if (strictMode) {
-            filteredPairs = filteredPairs.filter(pair => 
-                pair.liquidity.usd >= this.minLiquidity
-            );
-        } else {
-            // Relaxed mode - lower liquidity requirement
-            filteredPairs = filteredPairs.filter(pair => {
-                const pairAge = pair.pairCreatedAt ? 
-                    (Date.now() - new Date(pair.pairCreatedAt).getTime()) : 
-                    Infinity;
-                    
-                const isNew = pairAge <= 24 * 60 * 60 * 1000;
-                
-                return (isNew && pair.liquidity.usd >= this.minLiquidity / 4) || 
-                       (!isNew && pair.liquidity.usd >= this.minLiquidity / 2);
-            });
-        }
-        
-        return filteredPairs;
-    }
-    
-    // Analyze token based on its metrics
-    analyzeToken(pair) {
+    // Get enhanced token information using Moralis API
+    async getTokenInfo(tokenAddress) {
         try {
-            logger.deep(`Analyzing token ${pair.baseToken?.symbol || 'Unknown'}`);
-            const analysis = {
-                address: pair.baseToken?.address,
-                symbol: pair.baseToken?.symbol,
-                liquidity: pair.liquidity?.usd || 0,
-                volume24h: pair.volume?.h24 || 0,
-                priceChange24h: pair.priceChange?.h24 || 0,
-                createdAt: pair.pairCreatedAt,
-                price: pair.priceUsd,
-                score: 0,
-                reasons: [],
-                metrics: {}
-            };
-
-            // Calculate metrics
-            analysis.metrics.volumeToLiquidity = analysis.volume24h / analysis.liquidity;
-            analysis.metrics.ageInHours = pair.pairCreatedAt ? 
-                (new Date().getTime() - new Date(analysis.createdAt).getTime()) / (60 * 60 * 1000) : 
-                Infinity;
+            if (!tokenAddress) {
+                logger.error('Token address is required for getTokenInfo');
+                return null;
+            }
             
-            // Liquidity scoring (0-3 points)
-            if (analysis.liquidity >= this.minLiquidity) {
-                const liquidityScore = Math.min(3, Math.floor(analysis.liquidity / 10000));
-                analysis.score += liquidityScore;
-                analysis.reasons.push(`Liquidity score: ${liquidityScore}`);
+            const cacheKey = `moralis_info_${tokenAddress}`;
+            const cachedInfo = this.getFromCache(cacheKey);
+            
+            if (cachedInfo) {
+                logger.deep(`Using cached Moralis info for token ${tokenAddress}`);
+                return cachedInfo;
             }
-
-            // Volume/Liquidity ratio scoring (0-3 points)
-            if (analysis.metrics.volumeToLiquidity >= 0.5) {
-                const vlRatio = analysis.metrics.volumeToLiquidity;
-                const vlScore = Math.min(3, Math.floor(vlRatio / 3));
-                analysis.score += vlScore;
-                analysis.reasons.push(`Volume/Liquidity ratio score: ${vlScore}`);
+            
+            logger.deep(`Fetching enhanced token info from Moralis for ${tokenAddress}`);
+            
+            // Ensure Moralis is initialized
+            await this.ensureMoralisInitialized();
+            
+            // Get token metadata and price from Moralis
+            const [metadata, price] = await Promise.all([
+                moralisApi.getTokenMetadata('mainnet', tokenAddress),
+                moralisApi.getTokenPrice('mainnet', tokenAddress)
+            ]);
+            
+            if (!metadata && !price) {
+                logger.error(`No Moralis data found for token ${tokenAddress}`);
+                return null;
             }
-
-            // Price change scoring (0-3 points)
-            if (analysis.priceChange24h > 0) {
-                const priceScore = Math.min(3, Math.floor(analysis.priceChange24h / 20));
-                analysis.score += priceScore;
-                analysis.reasons.push(`Price momentum score: ${priceScore}`);
-            }
-
-            // Age scoring (0-2 points, favoring newer tokens but not too new)
-            if (analysis.metrics.ageInHours <= 168) { // 7 days
-                const ageScore = analysis.metrics.ageInHours >= 24 ? 2 : 1; // Prefer tokens >24h old
-                analysis.score += ageScore;
-                analysis.reasons.push(`Age score: ${ageScore}`);
-            }
-
-            logger.token(JSON.stringify({
-                ...analysis,
-                detailedMetrics: {
-                    volumeToLiquidity: analysis.metrics.volumeToLiquidity.toFixed(2),
-                    ageInHours: Math.floor(analysis.metrics.ageInHours)
-                }
-            }, null, 2));
-
-            return analysis;
+            
+            // Combine the data
+            const tokenInfo = {
+                address: tokenAddress,
+                metadata: metadata || null,
+                price: price || null,
+                fetchedAt: new Date().toISOString()
+            };
+            
+            // Cache the result
+            this.cacheToken(cacheKey, tokenInfo);
+            
+            return tokenInfo;
         } catch (error) {
-            logger.error(`Token analysis failed: ${error.message}`);
+            logger.error(`Failed to get enhanced token info for ${tokenAddress}: ${error.message}`);
             return null;
         }
     }
     
-    // Comprehensive token discovery using multiple approaches
+    // Enhance token data with additional information from Moralis
+    async enhanceTokenData(token) {
+        if (!token || !token.baseToken || !token.baseToken.address) {
+            return token;
+        }
+        
+        const tokenAddress = token.baseToken.address;
+        const enhancedInfo = await this.getTokenInfo(tokenAddress);
+        
+        if (!enhancedInfo) {
+            return token;
+        }
+        
+        // Add the enhanced information to the token
+        return {
+            ...token,
+            moralisData: enhancedInfo
+        };
+    }
+    
+    // Get enhanced token pools with additional information
+    async getEnhancedTokenPools(tokenAddress) {
+        const pools = await this.getTokenPools(tokenAddress);
+        
+        if (pools.length === 0) {
+            return [];
+        }
+        
+        // Get enhanced token info
+        const tokenInfo = await this.getTokenInfo(tokenAddress);
+        
+        // Add the enhanced information to each pool
+        return pools.map(pool => ({
+            ...pool,
+            moralisData: tokenInfo
+        }));
+    }
+    
+    // Discover tokens with comprehensive approach
     async discoverTokens() {
         try {
-            logger.high('Starting comprehensive token discovery using direct API approach');
+            logger.high('Starting comprehensive token discovery');
             
-            const allTokens = new Set();
+            // Get trending and new tokens
+            const [trendingTokens, newTokens] = await Promise.all([
+                this.getTrendingTokens(),
+                this.getNewTokens()
+            ]);
             
-            // 1. Get trending tokens
-            const trendingPairs = await this.getTrendingTokens();
-            trendingPairs.forEach(pair => {
-                if (pair.baseToken?.address) {
-                    allTokens.add(pair.baseToken.address);
-                }
-            });
+            // Combine and deduplicate tokens
+            const allTokens = [...trendingTokens, ...newTokens];
+            const uniqueTokens = Array.from(
+                new Map(allTokens.map(token => [token.baseToken?.address, token])).values()
+            );
             
-            // 2. Get new tokens
-            const newPairs = await this.getNewTokens();
-            newPairs.forEach(pair => {
-                if (pair.baseToken?.address) {
-                    allTokens.add(pair.baseToken.address);
-                }
-            });
+            // Filter out tokens with insufficient liquidity
+            const validTokens = uniqueTokens.filter(token => 
+                token.liquidity?.usd >= this.minLiquidity
+            );
             
-            // 3. Get tokens from popular DEXes
-            const popularDexes = await this.getPopularDexes();
-            for (const dex of popularDexes.slice(0, 5)) { // Limit to top 5 DEXes to avoid rate limits
-                const dexPairs = await this.getPairsFromDex(dex);
-                dexPairs.forEach(pair => {
-                    if (pair.baseToken?.address) {
-                        allTokens.add(pair.baseToken.address);
-                    }
-                });
-            }
-            
-            logger.high(`Discovered ${allTokens.size} unique tokens`);
-            
-            // Convert to pairs for analysis
-            const tokenPairs = [];
-            for (const tokenAddress of allTokens) {
-                // Check cache first
-                let pairData = this.getFromCache(`token_${tokenAddress}`);
+            // Calculate a discovery score for each token
+            const scoredTokens = await Promise.all(validTokens.map(async token => {
+                // Base metrics
+                const volumeToLiquidity = token.volume?.h24 / token.liquidity?.usd || 0;
+                const priceChangeScore = Math.abs(token.priceChange?.h24 || 0);
+                const ageInHours = token.pairCreatedAt ? 
+                    (Date.now() - new Date(token.pairCreatedAt).getTime()) / (1000 * 60 * 60) : 
+                    1000; // Default to old if no creation date
                 
-                if (!pairData) {
-                    // Try to find this token in our existing pairs
-                    pairData = [...trendingPairs, ...newPairs].find(
-                        pair => pair.baseToken?.address === tokenAddress
-                    );
+                // Age factor (newer tokens get higher score)
+                const ageFactor = Math.max(0, 1 - (ageInHours / (7 * 24))); // 0-1 scale, 0 for week-old tokens
+                
+                // Trending factor
+                const trendingFactor = token.trendingScore ? Math.min(1, token.trendingScore / 100) : 0;
+                
+                // Calculate base score
+                let score = (volumeToLiquidity * 40) + (priceChangeScore / 10) + (ageFactor * 30) + (trendingFactor * 30);
+                
+                // Determine discovery reasons
+                const reasons = [];
+                if (trendingFactor > 0.3) reasons.push('Trending');
+                if (ageFactor > 0.7) reasons.push('New');
+                if (volumeToLiquidity > 0.5) reasons.push('High Volume');
+                if (priceChangeScore > 5) reasons.push('Price Movement');
+                
+                // Get enhanced token info if available
+                let enhancedInfo = null;
+                try {
+                    enhancedInfo = await this.getTokenInfo(token.baseToken?.address);
                     
-                    if (!pairData) {
-                        // Get pools for this token
-                        const pools = await this.getTokenPools(tokenAddress);
-                        
-                        if (pools && pools.length > 0) {
-                            // Use the pool with highest liquidity
-                            pairData = pools.sort((a, b) => 
-                                (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
-                            )[0];
-                        }
+                    // Boost score if we have additional information
+                    if (enhancedInfo) {
+                        score += 10;
+                        reasons.push('Enhanced Data Available');
                     }
-                    
-                    if (pairData) {
-                        // Cache the result
-                        this.cacheToken(`token_${tokenAddress}`, pairData);
-                    }
+                } catch (error) {
+                    logger.error(`Error getting enhanced info for ${token.baseToken?.symbol}: ${error.message}`);
                 }
                 
-                if (pairData) {
-                    tokenPairs.push(pairData);
-                }
-            }
+                return {
+                    address: token.baseToken?.address,
+                    symbol: token.baseToken?.symbol,
+                    name: token.baseToken?.name,
+                    price: token.priceUsd,
+                    liquidity: token.liquidity?.usd,
+                    volume24h: token.volume?.h24,
+                    priceChange24h: token.priceChange?.h24,
+                    dexId: token.dexId,
+                    pairAddress: token.pairAddress,
+                    createdAt: token.pairCreatedAt,
+                    score,
+                    reasons,
+                    metrics: {
+                        volumeToLiquidity,
+                        priceChangeScore,
+                        ageInHours,
+                        ageFactor,
+                        trendingFactor
+                    },
+                    moralisData: enhancedInfo
+                };
+            }));
             
-            // Apply filtering
-            const filteredPairs = this.filterPairs(tokenPairs, true);
+            // Sort by score (highest first)
+            scoredTokens.sort((a, b) => b.score - a.score);
             
-            // Sort by score
-            const analyzedPairs = [];
-            for (const pair of filteredPairs) {
-                const analysis = this.analyzeToken(pair);
-                if (analysis) {
-                    analyzedPairs.push(analysis);
-                }
-            }
-            
-            // Sort by score descending
-            const topTokens = analyzedPairs
-                .sort((a, b) => b.score - a.score)
-                .slice(0, 20);
-            
-            logger.high(`Found ${topTokens.length} promising tokens`);
-            return topTokens;
+            logger.high(`Discovered ${scoredTokens.length} tokens with comprehensive approach`);
+            return scoredTokens;
         } catch (error) {
-            logger.error(`Token discovery failed: ${error.message}`);
+            logger.error(`Failed to discover tokens: ${error.message}`);
             return [];
         }
     }
