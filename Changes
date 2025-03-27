@@ -41,3 +41,18 @@
   - Tests for enhanceTokenData functionality
   - Tests for getEnhancedTokenPools functionality
   - Tests for enhanced token discovery
+
+## 2025-03-27: Merged DexScreener and OptimizedTokenDiscovery Without Search Queries
+
+- Created `src/mergedTokenDiscovery.js` that combines functionality from both components:
+  - Removed all search queries like "trending solana", "new solana", etc.
+  - Implemented direct DEX pair fetching using `/pairs` endpoint instead of search queries
+  - Integrated age-based token filtering from OptimizedTokenDiscovery
+  - Incorporated Moralis data enhancement for discovered tokens
+  - Added comprehensive token discovery without relying on search keywords
+
+- Created `src/test-merged-discovery.js` to test the merged implementation:
+  - Tests for getAllPairsFromPopularDexes functionality
+  - Tests for getRecentTokens functionality
+  - Tests for applyAgeBuyingCriteria functionality
+  - Tests for comprehensive token discovery without search queries
