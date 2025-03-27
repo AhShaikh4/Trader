@@ -71,10 +71,16 @@
   - `src/consolidated-test.js` for testing token discovery functionality
   - `src/test-consolidated-api.js` for testing the consolidated API module
 
-- Files that can be consolidated or removed:
-  - `src/dexScreener.js` (functionality moved to traderAPI.js)
+- Removed duplicate files:
   - `src/birdeyeApi.js` (functionality moved to traderAPI.js)
   - `src/jupiterApi.js` (functionality moved to traderAPI.js)
   - `src/tokenDiscovery.js` (superseded by mergedTokenDiscovery.js)
   - `src/optimizedTokenDiscovery.js` (superseded by mergedTokenDiscovery.js)
-  - Multiple test files can be consolidated into the new consolidated test files
+  - `src/test-birdeye.js` (tests consolidated into test-consolidated-api.js)
+  - `src/test-jupiter.js` (tests consolidated into test-consolidated-api.js)
+  - `src/test-discovery.js` (tests consolidated into consolidated-test.js)
+
+- Remaining files to consider for future consolidation:
+  - `src/dexScreener.js` (could be fully replaced by traderAPI.js after thorough testing)
+  - `src/test-dexscreener.js` (could be consolidated into test-consolidated-api.js)
+  - `src/mergedTokenDiscovery.js` (could be integrated into traderAPI.js)
