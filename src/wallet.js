@@ -42,4 +42,5 @@ class WalletManager {
     }
 }
 
-module.exports = new WalletManager();
+const walletManager = new WalletManager();
+module.exports = walletManager;
