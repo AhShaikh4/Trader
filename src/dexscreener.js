@@ -4,7 +4,6 @@ const logger = require('./logger');
 class DexScreenerApi {
     constructor() {
         this.baseUrl = 'https://api.dexscreener.com/latest/dex';
-        this.tokenPairsUrl = 'https://api.dexscreener.com/token-pairs/v1';
         this.minLiquidity = 10000; // $10,000 minimum liquidity
         this.maxPairAge = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
         
@@ -17,6 +16,9 @@ class DexScreenerApi {
         this.processingQueue = false;
         this.requestsPerMinute = 250; // Keep below the 300 limit for safety
         this.requestTimestamps = [];
+        
+        // Track processed pairs to avoid duplicates
+        this.processedPairs = new Set();
     }
 
     // Rate limiting methods
@@ -88,7 +90,7 @@ class DexScreenerApi {
         return cached.data;
     }
 
-    // Get all pairs from a specific DEX on Solana
+    // Get all pairs from a specific DEX on Solana using direct endpoint
     async getPairsFromDex(dexId) {
         try {
             const cacheKey = `dex_${dexId}`;
@@ -101,14 +103,10 @@ class DexScreenerApi {
             
             logger.deep(`Fetching pairs from DEX ${dexId}`);
             
-            // Use the search endpoint with the DEX name as query
-            // This is more reliable than trying to use a direct DEX endpoint
+            // Use the direct tokens endpoint with chainId=solana
+            // Then filter by dexId in the code
             const response = await this.queueRequest(() => 
-                axios.get(`${this.baseUrl}/search`, {
-                    params: {
-                        q: `${dexId} solana`
-                    }
-                })
+                axios.get(`${this.baseUrl}/tokens/solana`)
             );
             
             if (!response.data || !response.data.pairs) {
@@ -118,7 +116,7 @@ class DexScreenerApi {
             
             // Filter to only include pairs from this DEX
             const pairs = response.data.pairs.filter(pair => 
-                pair.dexId === dexId && pair.chainId === 'solana'
+                pair.dexId === dexId
             );
             
             logger.deep(`Found ${pairs.length} pairs on DEX ${dexId}`);
@@ -151,17 +149,17 @@ class DexScreenerApi {
             
             logger.deep(`Fetching pools for token ${tokenAddress}`);
             
-            // Use the token-pairs endpoint to get all pools for this token
+            // Use the direct tokens endpoint
             const response = await this.queueRequest(() => 
-                axios.get(`${this.tokenPairsUrl}/solana/${tokenAddress}`)
+                axios.get(`${this.baseUrl}/tokens/solana/${tokenAddress}`)
             );
             
-            if (!response.data || !Array.isArray(response.data)) {
+            if (!response.data || !response.data.pairs) {
                 logger.error(`Invalid response format for token ${tokenAddress}`);
                 return [];
             }
             
-            const pools = response.data;
+            const pools = response.data.pairs;
             
             logger.deep(`Found ${pools.length} pools for token ${tokenAddress}`);
             
@@ -175,51 +173,64 @@ class DexScreenerApi {
         }
     }
     
-    // Get trending tokens based on volume and price change
+    // Get recent pairs from all DEXes on Solana
+    async getRecentPairs() {
+        try {
+            logger.high('Fetching recent pairs from all DEXes on Solana');
+            
+            const cacheKey = 'recent_pairs_solana';
+            const cachedPairs = this.getFromCache(cacheKey);
+            
+            if (cachedPairs) {
+                logger.deep(`Using cached recent pairs for Solana`);
+                return cachedPairs;
+            }
+            
+            // Get all pairs from Solana chain
+            const response = await this.queueRequest(() => 
+                axios.get(`${this.baseUrl}/tokens/solana`)
+            );
+            
+            if (!response.data || !response.data.pairs) {
+                logger.error('Invalid response format for recent pairs');
+                return [];
+            }
+            
+            const allPairs = response.data.pairs;
+            const now = Date.now();
+            
+            // Filter pairs by age and liquidity
+            const recentPairs = allPairs.filter(pair => {
+                if (!pair.pairCreatedAt) return false;
+                
+                const pairAge = now - new Date(pair.pairCreatedAt).getTime();
+                const hasMinLiquidity = pair.liquidity?.usd >= this.minLiquidity;
+                
+                return pairAge <= this.maxPairAge && hasMinLiquidity;
+            });
+            
+            logger.deep(`Found ${recentPairs.length} recent pairs with minimum liquidity`);
+            
+            // Cache the result
+            this.cacheToken(cacheKey, recentPairs);
+            
+            return recentPairs;
+        } catch (error) {
+            logger.error(`Failed to fetch recent pairs: ${error.message}`);
+            return [];
+        }
+    }
+    
+    // Get trending tokens based on volume and price change without using keywords
     async getTrendingTokens() {
         try {
             logger.high('Fetching trending tokens based on volume and price change');
             
-            // Use the search endpoint with trending-related queries
-            const trendingQueries = [
-                'trending solana',
-                'new solana',
-                'volume solana',
-                'pump solana'
-            ];
-            
-            const allPairs = [];
-            
-            // Fetch results for each trending query
-            for (const query of trendingQueries) {
-                try {
-                    const response = await this.queueRequest(() => 
-                        axios.get(`${this.baseUrl}/search`, {
-                            params: { q: query }
-                        })
-                    );
-                    
-                    if (response.data && response.data.pairs) {
-                        // Filter to only include Solana pairs
-                        const solanaPairs = response.data.pairs.filter(pair => 
-                            pair.chainId === 'solana'
-                        );
-                        
-                        allPairs.push(...solanaPairs);
-                        logger.deep(`Found ${solanaPairs.length} pairs for query "${query}"`);
-                    }
-                } catch (error) {
-                    logger.error(`Failed to fetch trending pairs for query "${query}": ${error.message}`);
-                }
-            }
-            
-            // Deduplicate pairs by base token address
-            const uniquePairs = Array.from(
-                new Map(allPairs.map(pair => [pair.baseToken?.address, pair])).values()
-            );
+            // Get recent pairs from all DEXes
+            const allPairs = await this.getRecentPairs();
             
             // Filter out pairs with insufficient data
-            const validPairs = uniquePairs.filter(pair => 
+            const validPairs = allPairs.filter(pair => 
                 pair.volume?.h24 && pair.liquidity?.usd && pair.priceChange?.h24
             );
             
@@ -250,6 +261,106 @@ class DexScreenerApi {
             return trendingPairs;
         } catch (error) {
             logger.error(`Failed to fetch trending tokens: ${error.message}`);
+            return [];
+        }
+    }
+    
+    // Get top volume pairs from all DEXes on Solana
+    async getTopVolumePairs() {
+        try {
+            logger.high('Fetching top volume pairs from all DEXes on Solana');
+            
+            const cacheKey = 'top_volume_pairs_solana';
+            const cachedPairs = this.getFromCache(cacheKey);
+            
+            if (cachedPairs) {
+                logger.deep(`Using cached top volume pairs for Solana`);
+                return cachedPairs;
+            }
+            
+            // Get all pairs from Solana chain
+            const response = await this.queueRequest(() => 
+                axios.get(`${this.baseUrl}/tokens/solana`)
+            );
+            
+            if (!response.data || !response.data.pairs) {
+                logger.error('Invalid response format for top volume pairs');
+                return [];
+            }
+            
+            const allPairs = response.data.pairs;
+            
+            // Filter pairs by minimum liquidity
+            const liquidPairs = allPairs.filter(pair => 
+                pair.liquidity?.usd >= this.minLiquidity
+            );
+            
+            // Sort by 24h volume (highest first)
+            liquidPairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
+            
+            // Take top 50 volume pairs
+            const topVolumePairs = liquidPairs.slice(0, 50);
+            
+            logger.deep(`Found ${topVolumePairs.length} top volume pairs`);
+            
+            // Cache the result
+            this.cacheToken(cacheKey, topVolumePairs);
+            
+            return topVolumePairs;
+        } catch (error) {
+            logger.error(`Failed to fetch top volume pairs: ${error.message}`);
+            return [];
+        }
+    }
+    
+    // Get pairs with significant price movements
+    async getPriceMovementPairs() {
+        try {
+            logger.high('Fetching pairs with significant price movements');
+            
+            const cacheKey = 'price_movement_pairs_solana';
+            const cachedPairs = this.getFromCache(cacheKey);
+            
+            if (cachedPairs) {
+                logger.deep(`Using cached price movement pairs for Solana`);
+                return cachedPairs;
+            }
+            
+            // Get all pairs from Solana chain
+            const response = await this.queueRequest(() => 
+                axios.get(`${this.baseUrl}/tokens/solana`)
+            );
+            
+            if (!response.data || !response.data.pairs) {
+                logger.error('Invalid response format for price movement pairs');
+                return [];
+            }
+            
+            const allPairs = response.data.pairs;
+            
+            // Filter pairs by minimum liquidity and significant price movement
+            const significantPairs = allPairs.filter(pair => 
+                pair.liquidity?.usd >= this.minLiquidity && 
+                pair.priceChange?.h24 && 
+                Math.abs(pair.priceChange.h24) >= 5 // 5% or more price change
+            );
+            
+            // Sort by absolute price change (highest first)
+            significantPairs.sort((a, b) => 
+                Math.abs(b.priceChange?.h24 || 0) - Math.abs(a.priceChange?.h24 || 0)
+            );
+            
+            // Take top 50 price movement pairs
+            const topPriceMovementPairs = significantPairs.slice(0, 50);
+            
+            logger.deep(`Found ${topPriceMovementPairs.length} pairs with significant price movements`);
+            
+            // Cache the result
+            this.cacheToken(cacheKey, topPriceMovementPairs);
+            
+            return topPriceMovementPairs;
+        } catch (error) {
+            logger.error(`Failed to fetch price movement pairs: ${error.message}`);
             return [];
         }
     }
@@ -285,6 +396,90 @@ class DexScreenerApi {
             'fluxbeam',
             'pumpswap'
         ];
+    }
+    
+    // Comprehensive token discovery without using keywords
+    async discoverTokens() {
+        try {
+            logger.high('Starting comprehensive token discovery');
+            
+            // Reset processed pairs
+            this.processedPairs.clear();
+            
+            const allDiscoveredPairs = [];
+            
+            // 1. Get trending tokens
+            const trendingPairs = await this.getTrendingTokens();
+            this.addUniquePairs(allDiscoveredPairs, trendingPairs);
+            logger.deep(`Added ${trendingPairs.length} trending pairs`);
+            
+            // 2. Get top volume pairs
+            const topVolumePairs = await this.getTopVolumePairs();
+            this.addUniquePairs(allDiscoveredPairs, topVolumePairs);
+            logger.deep(`Added ${this.countNewPairs(topVolumePairs)} new top volume pairs`);
+            
+            // 3. Get price movement pairs
+            const priceMovementPairs = await this.getPriceMovementPairs();
+            this.addUniquePairs(allDiscoveredPairs, priceMovementPairs);
+            logger.deep(`Added ${this.countNewPairs(priceMovementPairs)} new price movement pairs`);
+            
+            // 4. Get recent pairs from top DEXes
+            const popularDexes = await this.getPopularDexes();
+            
+            // Limit to top 10 DEXes to save API credits
+            for (const dexId of popularDexes.slice(0, 10)) {
+                const dexPairs = await this.getPairsFromDex(dexId);
+                
+                // Filter by recency and minimum liquidity
+                const now = Date.now();
+                const recentDexPairs = dexPairs.filter(pair => {
+                    if (!pair.pairCreatedAt) return false;
+                    
+                    const pairAge = now - new Date(pair.pairCreatedAt).getTime();
+                    const hasMinLiquidity = pair.liquidity?.usd >= this.minLiquidity;
+                    
+                    return pairAge <= this.maxPairAge && hasMinLiquidity;
+                });
+                
+                this.addUniquePairs(allDiscoveredPairs, recentDexPairs);
+                logger.deep(`Added ${this.countNewPairs(recentDexPairs)} new pairs from DEX ${dexId}`);
+            }
+            
+            logger.high(`Comprehensive token discovery complete. Found ${allDiscoveredPairs.length} unique pairs`);
+            return allDiscoveredPairs;
+        } catch (error) {
+            logger.error(`Token discovery failed: ${error.message}`);
+            return [];
+        }
+    }
+    
+    // Helper method to add unique pairs to the result array
+    addUniquePairs(resultArray, newPairs) {
+        for (const pair of newPairs) {
+            if (!pair.baseToken?.address) continue;
+            
+            const pairKey = pair.baseToken.address;
+            
+            if (!this.processedPairs.has(pairKey)) {
+                this.processedPairs.add(pairKey);
+                resultArray.push(pair);
+            }
+        }
+    }
+    
+    // Helper method to count new pairs that haven't been processed yet
+    countNewPairs(pairs) {
+        let count = 0;
+        for (const pair of pairs) {
+            if (!pair.baseToken?.address) continue;
+            
+            const pairKey = pair.baseToken.address;
+            
+            if (!this.processedPairs.has(pairKey)) {
+                count++;
+            }
+        }
+        return count;
     }
 }
 
