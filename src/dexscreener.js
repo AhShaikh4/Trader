@@ -4,6 +4,7 @@ const logger = require('./logger');
 class DexScreenerApi {
     constructor() {
         this.baseUrl = 'https://api.dexscreener.com/latest/dex';
+        this.tokenPairsUrl = 'https://api.dexscreener.com/token-pairs/v1';
         this.minLiquidity = 10000; // $10,000 minimum liquidity
         this.maxPairAge = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds
         
@@ -14,8 +15,12 @@ class DexScreenerApi {
         // Rate limiting implementation
         this.requestQueue = [];
         this.processingQueue = false;
-        this.requestsPerMinute = 250; // Keep below the 300 limit for safety
+        this.requestsPerMinute = 55; // More conservative rate limit (55 vs 250)
         this.requestTimestamps = [];
+        
+        // Token diversity tracking
+        this.lastFetchedTokens = new Set();
+        this.fetchCounter = 0;
         
         // Track processed pairs to avoid duplicates
         this.processedPairs = new Set();
@@ -25,7 +30,7 @@ class DexScreenerApi {
         this.maxRetries = 3;
     }
 
-    // Rate limiting methods
+    // Rate limiting methods with retry mechanism
     async queueRequest(requestFn, retryCount = 0) {
         return new Promise((resolve, reject) => {
             this.requestQueue.push({ requestFn, resolve, reject, retryCount });
@@ -106,7 +111,7 @@ class DexScreenerApi {
         return cached.data;
     }
 
-    // Get all pairs from a specific DEX on Solana using search endpoint
+    // Get all pairs from a specific DEX on Solana
     async getPairsFromDex(dexId) {
         try {
             const cacheKey = `dex_${dexId}`;
@@ -119,11 +124,11 @@ class DexScreenerApi {
             
             logger.deep(`Fetching pairs from DEX ${dexId}`);
             
-            // Use the search endpoint with dexId as part of the query
+            // Use the search endpoint with the DEX name as query
             const response = await this.queueRequest(() => 
                 axios.get(`${this.baseUrl}/search`, {
                     params: {
-                        q: `solana ${dexId}`
+                        q: `${dexId} solana`
                     }
                 })
             );
@@ -133,9 +138,9 @@ class DexScreenerApi {
                 return this.getFallbackPairsForDex(dexId);
             }
             
-            // Filter to only include pairs from Solana chain and this DEX
+            // Filter to only include pairs from this DEX
             const pairs = response.data.pairs.filter(pair => 
-                pair.chainId === 'solana' && pair.dexId === dexId
+                pair.dexId === dexId && pair.chainId === 'solana'
             );
             
             logger.deep(`Found ${pairs.length} pairs on DEX ${dexId}`);
@@ -163,7 +168,7 @@ class DexScreenerApi {
                     const fallbackResponse = await this.queueRequest(() => 
                         axios.get(`${this.baseUrl}/search`, {
                             params: {
-                                q: query
+                                q: `${query} ${dexId}`
                             }
                         })
                     );
@@ -234,25 +239,17 @@ class DexScreenerApi {
             
             logger.deep(`Fetching pools for token ${tokenAddress}`);
             
-            // Use the search endpoint with token address
+            // Use the token-pairs endpoint to get all pools for this token
             const response = await this.queueRequest(() => 
-                axios.get(`${this.baseUrl}/search`, {
-                    params: {
-                        q: tokenAddress
-                    }
-                })
+                axios.get(`${this.tokenPairsUrl}/solana/${tokenAddress}`)
             );
             
-            if (!response.data || !response.data.pairs) {
+            if (!response.data || !Array.isArray(response.data)) {
                 logger.error(`Invalid response format for token ${tokenAddress}`);
                 return this.getFallbackPoolsForToken(tokenAddress);
             }
             
-            // Filter to only include pairs from Solana chain with this token
-            const pools = response.data.pairs.filter(pair => 
-                pair.chainId === 'solana' && 
-                (pair.baseToken?.address === tokenAddress || pair.quoteToken?.address === tokenAddress)
-            );
+            const pools = response.data;
             
             logger.deep(`Found ${pools.length} pools for token ${tokenAddress}`);
             
@@ -271,23 +268,30 @@ class DexScreenerApi {
         try {
             logger.deep(`Trying fallback approach for token ${tokenAddress}`);
             
-            // Try direct token endpoint
+            // Try search endpoint with token address
             try {
-                const tokenResponse = await this.queueRequest(() => 
-                    axios.get(`${this.baseUrl}/tokens/${tokenAddress}`)
+                const searchResponse = await this.queueRequest(() => 
+                    axios.get(`${this.baseUrl}/search`, {
+                        params: {
+                            q: tokenAddress
+                        }
+                    })
                 );
                 
-                if (tokenResponse.data && tokenResponse.data.pairs) {
-                    // Filter to only include pairs from Solana chain
-                    const tokenPairs = tokenResponse.data.pairs.filter(pair => 
-                        pair.chainId === 'solana'
+                if (searchResponse.data && searchResponse.data.pairs) {
+                    // Filter to only include pairs from Solana chain with this token
+                    const searchPairs = searchResponse.data.pairs.filter(pair => 
+                        pair.chainId === 'solana' && 
+                        (pair.baseToken?.address === tokenAddress || pair.quoteToken?.address === tokenAddress)
                     );
                     
-                    logger.deep(`Found ${tokenPairs.length} pools for token ${tokenAddress} using direct token endpoint`);
-                    return tokenPairs;
+                    if (searchPairs.length > 0) {
+                        logger.deep(`Found ${searchPairs.length} pools for token ${tokenAddress} using search endpoint`);
+                        return searchPairs;
+                    }
                 }
-            } catch (tokenError) {
-                logger.error(`Direct token endpoint failed: ${tokenError.message}`);
+            } catch (searchError) {
+                logger.error(`Search endpoint failed: ${searchError.message}`);
             }
             
             // If direct endpoint fails, try getting all Solana pairs and filtering
@@ -305,7 +309,7 @@ class DexScreenerApi {
         }
     }
     
-    // Get Solana pairs using search
+    // Get Solana pairs using search with rotating queries
     async getSolanaPairs() {
         try {
             logger.high('Fetching Solana pairs');
@@ -318,11 +322,29 @@ class DexScreenerApi {
                 return cachedPairs;
             }
             
-            // Use search endpoint with "solana" query
+            // Increment fetch counter to track calls
+            this.fetchCounter++;
+            
+            // Use a wider variety of search queries that rotate based on fetch counter
+            const allQueries = [
+                'solana',
+                'sol',
+                'solana chain',
+                'sol chain',
+                'solana dex'
+            ];
+            
+            // Select a query based on the fetch counter
+            const queryIndex = this.fetchCounter % allQueries.length;
+            const query = allQueries[queryIndex];
+            
+            logger.deep(`Using query: "${query}"`);
+            
+            // Use search endpoint with the selected query
             const response = await this.queueRequest(() => 
                 axios.get(`${this.baseUrl}/search`, {
                     params: {
-                        q: 'solana'
+                        q: query
                     }
                 })
             );
@@ -355,7 +377,7 @@ class DexScreenerApi {
             logger.deep('Trying fallback approaches for Solana pairs');
             
             // Try multiple fallback queries
-            const fallbackQueries = ['sol', 'solana chain'];
+            const fallbackQueries = ['solana token', 'sol token', 'solana crypto'];
             
             for (const query of fallbackQueries) {
                 try {
@@ -417,113 +439,125 @@ class DexScreenerApi {
         }
     }
     
-    // Get recent pairs from all DEXes on Solana
-    async getRecentPairs() {
-        try {
-            logger.high('Fetching recent pairs from all DEXes on Solana');
-            
-            const cacheKey = 'recent_pairs_solana';
-            const cachedPairs = this.getFromCache(cacheKey);
-            
-            if (cachedPairs) {
-                logger.deep(`Using cached recent pairs for Solana`);
-                return cachedPairs;
-            }
-            
-            // Get all Solana pairs
-            const allPairs = await this.getSolanaPairs();
-            
-            const now = Date.now();
-            
-            // Filter pairs by age and liquidity
-            const recentPairs = allPairs.filter(pair => {
-                if (!pair.pairCreatedAt) return false;
-                
-                const pairAge = now - pair.pairCreatedAt;
-                const hasMinLiquidity = pair.liquidity?.usd >= this.minLiquidity;
-                
-                return pairAge <= this.maxPairAge && hasMinLiquidity;
-            });
-            
-            logger.deep(`Found ${recentPairs.length} recent pairs with minimum liquidity`);
-            
-            // Cache the result
-            this.cacheToken(cacheKey, recentPairs);
-            
-            return recentPairs;
-        } catch (error) {
-            logger.error(`Failed to fetch recent pairs: ${error.message}`);
-            
-            // Fallback: try getting recent pairs from each popular DEX
-            try {
-                logger.deep('Trying fallback approach for recent pairs');
-                const popularDexes = await this.getPopularDexes();
-                let allRecentPairs = [];
-                const now = Date.now();
-                
-                for (const dexId of popularDexes.slice(0, 5)) {
-                    try {
-                        const dexPairs = await this.getPairsFromDex(dexId);
-                        
-                        // Filter by recency and liquidity
-                        const recentDexPairs = dexPairs.filter(pair => {
-                            if (!pair.pairCreatedAt) return false;
-                            
-                            const pairAge = now - pair.pairCreatedAt;
-                            const hasMinLiquidity = pair.liquidity?.usd >= this.minLiquidity;
-                            
-                            return pairAge <= this.maxPairAge && hasMinLiquidity;
-                        });
-                        
-                        allRecentPairs = [...allRecentPairs, ...recentDexPairs];
-                    } catch (dexError) {
-                        logger.error(`Failed to get recent pairs from DEX ${dexId}: ${dexError.message}`);
-                    }
-                }
-                
-                // Remove duplicates
-                const uniquePairs = [];
-                const seenPairAddresses = new Set();
-                
-                for (const pair of allRecentPairs) {
-                    if (!seenPairAddresses.has(pair.pairAddress)) {
-                        seenPairAddresses.add(pair.pairAddress);
-                        uniquePairs.push(pair);
-                    }
-                }
-                
-                logger.deep(`Found ${uniquePairs.length} unique recent Solana pairs using fallback approach`);
-                return uniquePairs;
-            } catch (fallbackError) {
-                logger.error(`Fallback approach for recent pairs failed: ${fallbackError.message}`);
-                return [];
-            }
-        }
-    }
-    
-    // Get trending tokens based on volume and price change
+    // Get trending tokens with improved diversity and rotating queries
     async getTrendingTokens() {
         try {
-            logger.high('Fetching trending tokens based on volume and price change');
+            logger.high('Fetching trending tokens from DexScreener');
             
-            // Get Solana pairs
-            const allPairs = await this.getSolanaPairs();
+            // Increment fetch counter to track calls
+            this.fetchCounter++;
             
-            // Filter out pairs with insufficient data
-            const validPairs = allPairs.filter(pair => 
-                pair.volume?.h24 && pair.liquidity?.usd && pair.priceChange?.h24
+            // Use a wider variety of search queries that rotate based on fetch counter
+            // This helps ensure we get different tokens on each call
+            const allQueries = [
+                // Volume-based queries
+                'volume solana',
+                'high volume solana',
+                'volume 24h solana',
+                'liquidity solana',
+                
+                // Trending/popularity queries
+                'trending solana',
+                'popular solana',
+                'hot solana',
+                
+                // Price action queries
+                'pump solana',
+                'price change solana',
+                'movers solana',
+                
+                // Timeframe-based queries
+                'new solana',
+                'recent solana',
+                'launch solana',
+                
+                // DEX-specific queries
+                'raydium new',
+                'jupiter trending',
+                'orca volume',
+                
+                // Combination queries
+                'new high volume solana',
+                'trending pump solana',
+                'hot tokens solana'
+            ];
+            
+            // Select a subset of queries based on the fetch counter
+            // This ensures we rotate through different query sets on each call
+            const querySetSize = 5;
+            const startIndex = (this.fetchCounter * querySetSize) % allQueries.length;
+            const selectedQueries = [];
+            
+            for (let i = 0; i < querySetSize; i++) {
+                const index = (startIndex + i) % allQueries.length;
+                selectedQueries.push(allQueries[index]);
+            }
+            
+            logger.deep(`Using query set: ${selectedQueries.join(', ')}`);
+            
+            const allPairs = [];
+            
+            // Fetch results for each selected query
+            for (const query of selectedQueries) {
+                try {
+                    const response = await this.queueRequest(() => 
+                        axios.get(`${this.baseUrl}/search`, {
+                            params: { q: query }
+                        })
+                    );
+                    
+                    if (response.data && response.data.pairs) {
+                        // Filter to only include Solana pairs
+                        const solanaPairs = response.data.pairs.filter(pair => 
+                            pair.chainId === 'solana'
+                        );
+                        
+                        allPairs.push(...solanaPairs);
+                        logger.deep(`Found ${solanaPairs.length} pairs for query "${query}"`);
+                    }
+                } catch (error) {
+                    logger.error(`Failed to fetch trending pairs for query "${query}": ${error.message}`);
+                    // Continue with other queries even if one fails
+                }
+            }
+            
+            // Deduplicate pairs by base token address
+            const uniquePairs = Array.from(
+                new Map(allPairs.map(pair => [pair.baseToken?.address, pair])).values()
             );
             
-            // Calculate a trending score for each pair
+            // Filter out pairs with insufficient data
+            const validPairs = uniquePairs.filter(pair => 
+                pair.baseToken?.address && 
+                pair.volume?.h24 && 
+                pair.liquidity?.usd && 
+                pair.priceChange
+            );
+            
+            // Calculate a trending score for each pair using multiple metrics
             const scoredPairs = validPairs.map(pair => {
                 // Calculate volume to liquidity ratio (higher is better)
                 const volumeToLiquidity = pair.volume.h24 / pair.liquidity.usd;
                 
                 // Calculate price change score (absolute value, higher is better)
-                const priceChangeScore = Math.abs(pair.priceChange.h24);
+                const priceChangeScore = Math.abs(pair.priceChange.h24 || 0);
+                
+                // Calculate age score (newer is better)
+                const now = Date.now();
+                const pairAge = pair.pairCreatedAt ? (now - pair.pairCreatedAt) : 0;
+                const ageScore = pairAge > 0 ? Math.max(0, 1 - (pairAge / this.maxPairAge)) : 0;
+                
+                // Calculate buy/sell ratio (higher is better)
+                const buys = pair.txns?.h24?.buys || 0;
+                const sells = pair.txns?.h24?.sells || 0;
+                const buyToSellRatio = sells > 0 ? buys / sells : buys;
+                const buyToSellScore = Math.min(5, buyToSellRatio);
                 
                 // Calculate combined score
-                const score = (volumeToLiquidity * 50) + (priceChangeScore / 10);
+                const score = (volumeToLiquidity * 40) + 
+                              (priceChangeScore / 10) + 
+                              (ageScore * 20) + 
+                              (buyToSellScore * 5);
                 
                 return {
                     ...pair,
@@ -534,8 +568,33 @@ class DexScreenerApi {
             // Sort by trending score (highest first)
             scoredPairs.sort((a, b) => b.trendingScore - a.trendingScore);
             
+            // Track which tokens we've already returned
+            const previousTokens = new Set(this.lastFetchedTokens);
+            
+            // Filter out tokens we returned in the previous call to ensure diversity
+            const diversePairs = scoredPairs.filter(pair => 
+                !previousTokens.has(pair.baseToken.address)
+            );
+            
+            // If we filtered out too many, add some back from the original list
+            let resultPairs = diversePairs;
+            if (diversePairs.length < 10 && scoredPairs.length > 0) {
+                // Take some from the original list to ensure we have enough results
+                const remainingNeeded = Math.min(10, scoredPairs.length) - diversePairs.length;
+                const additionalPairs = scoredPairs
+                    .filter(pair => !diversePairs.some(dp => dp.baseToken.address === pair.baseToken.address))
+                    .slice(0, remainingNeeded);
+                
+                resultPairs = [...diversePairs, ...additionalPairs];
+            }
+            
             // Take top 50 trending pairs
-            const trendingPairs = scoredPairs.slice(0, 50);
+            const trendingPairs = resultPairs.slice(0, 50);
+            
+            // Update our tracking of returned tokens
+            this.lastFetchedTokens = new Set(
+                trendingPairs.map(pair => pair.baseToken.address)
+            );
             
             logger.high(`Found ${trendingPairs.length} trending tokens`);
             return trendingPairs;
@@ -544,134 +603,11 @@ class DexScreenerApi {
             
             // Fallback: try getting top volume pairs as a substitute
             try {
-                const topVolumePairs = await this.getTopVolumePairs();
-                logger.deep(`Using ${topVolumePairs.length} top volume pairs as fallback for trending tokens`);
+                const topVolumePairs = await this.getHighVolumeTokens();
+                logger.deep(`Using ${topVolumePairs.length} high volume pairs as fallback for trending tokens`);
                 return topVolumePairs;
             } catch (fallbackError) {
                 logger.error(`Fallback for trending tokens failed: ${fallbackError.message}`);
-                return [];
-            }
-        }
-    }
-    
-    // Get top volume pairs from all DEXes on Solana
-    async getTopVolumePairs() {
-        try {
-            logger.high('Fetching top volume pairs from all DEXes on Solana');
-            
-            const cacheKey = 'top_volume_pairs_solana';
-            const cachedPairs = this.getFromCache(cacheKey);
-            
-            if (cachedPairs) {
-                logger.deep(`Using cached top volume pairs for Solana`);
-                return cachedPairs;
-            }
-            
-            // Get Solana pairs
-            const allPairs = await this.getSolanaPairs();
-            
-            // Filter pairs by minimum liquidity
-            const liquidPairs = allPairs.filter(pair => 
-                pair.liquidity?.usd >= this.minLiquidity
-            );
-            
-            // Sort by 24h volume (highest first)
-            liquidPairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
-            
-            // Take top 50 volume pairs
-            const topVolumePairs = liquidPairs.slice(0, 50);
-            
-            logger.deep(`Found ${topVolumePairs.length} top volume pairs`);
-            
-            // Cache the result
-            this.cacheToken(cacheKey, topVolumePairs);
-            
-            return topVolumePairs;
-        } catch (error) {
-            logger.error(`Failed to fetch top volume pairs: ${error.message}`);
-            
-            // Fallback: try getting pairs from each popular DEX and sorting by volume
-            try {
-                logger.deep('Trying fallback approach for top volume pairs');
-                const popularDexes = await this.getPopularDexes();
-                let allPairs = [];
-                
-                for (const dexId of popularDexes.slice(0, 5)) {
-                    try {
-                        const dexPairs = await this.getPairsFromDex(dexId);
-                        allPairs = [...allPairs, ...dexPairs];
-                    } catch (dexError) {
-                        logger.error(`Failed to get pairs from DEX ${dexId}: ${dexError.message}`);
-                    }
-                }
-                
-                // Filter by minimum liquidity
-                const liquidPairs = allPairs.filter(pair => 
-                    pair.liquidity?.usd >= this.minLiquidity
-                );
-                
-                // Sort by 24h volume (highest first)
-                liquidPairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
-                
-                // Take top 50 volume pairs
-                const topVolumePairs = liquidPairs.slice(0, 50);
-                
-                logger.deep(`Found ${topVolumePairs.length} top volume pairs using fallback approach`);
-                return topVolumePairs;
-            } catch (fallbackError) {
-                logger.error(`Fallback approach for top volume pairs failed: ${fallbackError.message}`);
-                return [];
-            }
-        }
-    }
-    
-    // Get pairs with significant price movements
-    async getPriceMovementPairs() {
-        try {
-            logger.high('Fetching pairs with significant price movements');
-            
-            const cacheKey = 'price_movement_pairs_solana';
-            const cachedPairs = this.getFromCache(cacheKey);
-            
-            if (cachedPairs) {
-                logger.deep(`Using cached price movement pairs for Solana`);
-                return cachedPairs;
-            }
-            
-            // Get Solana pairs
-            const allPairs = await this.getSolanaPairs();
-            
-            // Filter pairs by minimum liquidity and significant price movement
-            const significantPairs = allPairs.filter(pair => 
-                pair.liquidity?.usd >= this.minLiquidity && 
-                pair.priceChange?.h24 && 
-                Math.abs(pair.priceChange.h24) >= 5 // 5% or more price change
-            );
-            
-            // Sort by absolute price change (highest first)
-            significantPairs.sort((a, b) => 
-                Math.abs(b.priceChange?.h24 || 0) - Math.abs(a.priceChange?.h24 || 0)
-            );
-            
-            // Take top 50 price movement pairs
-            const topPriceMovementPairs = significantPairs.slice(0, 50);
-            
-            logger.deep(`Found ${topPriceMovementPairs.length} pairs with significant price movements`);
-            
-            // Cache the result
-            this.cacheToken(cacheKey, topPriceMovementPairs);
-            
-            return topPriceMovementPairs;
-        } catch (error) {
-            logger.error(`Failed to fetch price movement pairs: ${error.message}`);
-            
-            // Fallback: try getting trending tokens as a substitute
-            try {
-                const trendingPairs = await this.getTrendingTokens();
-                logger.deep(`Using ${trendingPairs.length} trending pairs as fallback for price movement pairs`);
-                return trendingPairs;
-            } catch (fallbackError) {
-                logger.error(`Fallback for price movement pairs failed: ${fallbackError.message}`);
                 return [];
             }
         }
@@ -710,6 +646,225 @@ class DexScreenerApi {
         ];
     }
     
+    // Get recently created tokens with rotating queries
+    async getRecentTokens() {
+        try {
+            logger.high('Fetching recently created tokens');
+            
+            // Increment fetch counter
+            this.fetchCounter++;
+            
+            const recentQueries = [
+                'new solana',
+                'launch solana',
+                'recent solana',
+                'today solana',
+                'just launched solana'
+            ];
+            
+            // Select a subset of queries based on the fetch counter
+            const querySetSize = 3;
+            const startIndex = (this.fetchCounter * querySetSize) % recentQueries.length;
+            const selectedQueries = [];
+            
+            for (let i = 0; i < querySetSize; i++) {
+                const index = (startIndex + i) % recentQueries.length;
+                selectedQueries.push(recentQueries[index]);
+            }
+            
+            logger.deep(`Using query set for recent tokens: ${selectedQueries.join(', ')}`);
+            
+            const allPairs = [];
+            
+            // Fetch results for each selected query
+            for (const query of selectedQueries) {
+                try {
+                    const response = await this.queueRequest(() => 
+                        axios.get(`${this.baseUrl}/search`, {
+                            params: { q: query }
+                        })
+                    );
+                    
+                    if (response.data && response.data.pairs) {
+                        // Filter to only include Solana pairs
+                        const solanaPairs = response.data.pairs.filter(pair => 
+                            pair.chainId === 'solana' && pair.pairCreatedAt
+                        );
+                        
+                        allPairs.push(...solanaPairs);
+                        logger.deep(`Found ${solanaPairs.length} pairs for query "${query}"`);
+                    }
+                } catch (error) {
+                    logger.error(`Failed to fetch recent pairs for query "${query}": ${error.message}`);
+                }
+            }
+            
+            // Deduplicate pairs by base token address
+            const uniquePairs = Array.from(
+                new Map(allPairs.map(pair => [pair.baseToken?.address, pair])).values()
+            );
+            
+            // Sort by creation time (newest first)
+            uniquePairs.sort((a, b) => (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0));
+            
+            // Filter out tokens we returned in the previous call to ensure diversity
+            const previousTokens = new Set(this.lastFetchedTokens);
+            const diversePairs = uniquePairs.filter(pair => 
+                pair.baseToken?.address && !previousTokens.has(pair.baseToken.address)
+            );
+            
+            // Take top 30 newest pairs
+            const recentPairs = diversePairs.slice(0, 30);
+            
+            // Update our tracking with these tokens too
+            for (const pair of recentPairs) {
+                if (pair.baseToken?.address) {
+                    this.lastFetchedTokens.add(pair.baseToken.address);
+                }
+            }
+            
+            logger.high(`Found ${recentPairs.length} recent tokens`);
+            return recentPairs;
+        } catch (error) {
+            logger.error(`Failed to fetch recent tokens: ${error.message}`);
+            
+            // Fallback: try getting pairs from popular DEXes and sorting by creation time
+            try {
+                logger.deep('Trying fallback approach for recent tokens');
+                const popularDexes = await this.getPopularDexes();
+                let allPairs = [];
+                
+                for (const dexId of popularDexes.slice(0, 5)) {
+                    try {
+                        const dexPairs = await this.getPairsFromDex(dexId);
+                        allPairs = [...allPairs, ...dexPairs];
+                    } catch (dexError) {
+                        logger.error(`Failed to get pairs from DEX ${dexId}: ${dexError.message}`);
+                    }
+                }
+                
+                // Filter to only include pairs with creation time
+                const pairsWithCreationTime = allPairs.filter(pair => pair.pairCreatedAt);
+                
+                // Sort by creation time (newest first)
+                pairsWithCreationTime.sort((a, b) => (b.pairCreatedAt || 0) - (a.pairCreatedAt || 0));
+                
+                // Take top 30 newest pairs
+                const fallbackRecentPairs = pairsWithCreationTime.slice(0, 30);
+                
+                logger.deep(`Found ${fallbackRecentPairs.length} recent tokens using fallback approach`);
+                return fallbackRecentPairs;
+            } catch (fallbackError) {
+                logger.error(`Fallback approach for recent tokens failed: ${fallbackError.message}`);
+                return [];
+            }
+        }
+    }
+    
+    // Get high volume tokens with rotating queries
+    async getHighVolumeTokens() {
+        try {
+            logger.high('Fetching high volume tokens');
+            
+            // Increment fetch counter
+            this.fetchCounter++;
+            
+            const volumeQueries = [
+                'volume solana',
+                'high volume solana',
+                'trading volume solana',
+                'active solana'
+            ];
+            
+            // Select a subset of queries based on the fetch counter
+            const querySetSize = 2;
+            const startIndex = (this.fetchCounter * querySetSize) % volumeQueries.length;
+            const selectedQueries = [];
+            
+            for (let i = 0; i < querySetSize; i++) {
+                const index = (startIndex + i) % volumeQueries.length;
+                selectedQueries.push(volumeQueries[index]);
+            }
+            
+            logger.deep(`Using query set for high volume tokens: ${selectedQueries.join(', ')}`);
+            
+            const allPairs = [];
+            
+            // Fetch results for each selected query
+            for (const query of selectedQueries) {
+                try {
+                    const response = await this.queueRequest(() => 
+                        axios.get(`${this.baseUrl}/search`, {
+                            params: { q: query }
+                        })
+                    );
+                    
+                    if (response.data && response.data.pairs) {
+                        // Filter to only include Solana pairs with volume data
+                        const solanaPairs = response.data.pairs.filter(pair => 
+                            pair.chainId === 'solana' && pair.volume?.h24
+                        );
+                        
+                        allPairs.push(...solanaPairs);
+                        logger.deep(`Found ${solanaPairs.length} pairs for query "${query}"`);
+                    }
+                } catch (error) {
+                    logger.error(`Failed to fetch volume pairs for query "${query}": ${error.message}`);
+                }
+            }
+            
+            // Deduplicate pairs by base token address
+            const uniquePairs = Array.from(
+                new Map(allPairs.map(pair => [pair.baseToken?.address, pair])).values()
+            );
+            
+            // Sort by 24h volume (highest first)
+            uniquePairs.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
+            
+            // Filter out tokens we returned in the previous call to ensure diversity
+            const previousTokens = new Set(this.lastFetchedTokens);
+            const diversePairs = uniquePairs.filter(pair => 
+                pair.baseToken?.address && !previousTokens.has(pair.baseToken.address)
+            );
+            
+            // Take top 30 highest volume pairs
+            const volumePairs = diversePairs.slice(0, 30);
+            
+            // Update our tracking with these tokens too
+            for (const pair of volumePairs) {
+                if (pair.baseToken?.address) {
+                    this.lastFetchedTokens.add(pair.baseToken.address);
+                }
+            }
+            
+            logger.high(`Found ${volumePairs.length} high volume tokens`);
+            return volumePairs;
+        } catch (error) {
+            logger.error(`Failed to fetch high volume tokens: ${error.message}`);
+            
+            // Fallback: try getting all Solana pairs and sorting by volume
+            try {
+                logger.deep('Trying fallback approach for high volume tokens');
+                const allPairs = await this.getSolanaPairs();
+                
+                // Filter to only include pairs with volume data
+                const pairsWithVolume = allPairs.filter(pair => pair.volume?.h24);
+                
+                // Sort by 24h volume (highest first)
+                pairsWithVolume.sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0));
+                
+                // Take top 30 highest volume pairs
+                const fallbackVolumePairs = pairsWithVolume.slice(0, 30);
+                
+                logger.deep(`Found ${fallbackVolumePairs.length} high volume tokens using fallback approach`);
+                return fallbackVolumePairs;
+            } catch (fallbackError) {
+                logger.error(`Fallback approach for high volume tokens failed: ${fallbackError.message}`);
+                return [];
+            }
+        }
+    }
+    
     // Get pairs with high buy/sell ratio (bullish sentiment)
     async getBullishPairs() {
         try {
@@ -742,8 +897,21 @@ class DexScreenerApi {
             // Sort by buy/sell ratio (highest first)
             scoredPairs.sort((a, b) => b.buyToSellRatio - a.buyToSellRatio);
             
+            // Filter out tokens we returned in the previous call to ensure diversity
+            const previousTokens = new Set(this.lastFetchedTokens);
+            const diversePairs = scoredPairs.filter(pair => 
+                pair.baseToken?.address && !previousTokens.has(pair.baseToken.address)
+            );
+            
             // Take top 30 bullish pairs
-            const bullishPairs = scoredPairs.slice(0, 30);
+            const bullishPairs = diversePairs.slice(0, 30);
+            
+            // Update our tracking with these tokens too
+            for (const pair of bullishPairs) {
+                if (pair.baseToken?.address) {
+                    this.lastFetchedTokens.add(pair.baseToken.address);
+                }
+            }
             
             logger.deep(`Found ${bullishPairs.length} pairs with bullish sentiment`);
             return bullishPairs;
@@ -752,7 +920,7 @@ class DexScreenerApi {
             
             // Fallback: try getting recent pairs as a substitute
             try {
-                const recentPairs = await this.getRecentPairs();
+                const recentPairs = await this.getRecentTokens();
                 logger.deep(`Using ${recentPairs.length} recent pairs as fallback for bullish pairs`);
                 return recentPairs;
             } catch (fallbackError) {
@@ -798,8 +966,21 @@ class DexScreenerApi {
             // Sort by volume growth ratio (highest first)
             scoredPairs.sort((a, b) => b.volumeGrowthRatio - a.volumeGrowthRatio);
             
+            // Filter out tokens we returned in the previous call to ensure diversity
+            const previousTokens = new Set(this.lastFetchedTokens);
+            const diversePairs = scoredPairs.filter(pair => 
+                pair.baseToken?.address && !previousTokens.has(pair.baseToken.address)
+            );
+            
             // Take top 30 volume growth pairs
-            const volumeGrowthPairs = scoredPairs.slice(0, 30);
+            const volumeGrowthPairs = diversePairs.slice(0, 30);
+            
+            // Update our tracking with these tokens too
+            for (const pair of volumeGrowthPairs) {
+                if (pair.baseToken?.address) {
+                    this.lastFetchedTokens.add(pair.baseToken.address);
+                }
+            }
             
             logger.deep(`Found ${volumeGrowthPairs.length} pairs with high volume growth`);
             return volumeGrowthPairs;
@@ -808,7 +989,7 @@ class DexScreenerApi {
             
             // Fallback: try getting top volume pairs as a substitute
             try {
-                const topVolumePairs = await this.getTopVolumePairs();
+                const topVolumePairs = await this.getHighVolumeTokens();
                 logger.deep(`Using ${topVolumePairs.length} top volume pairs as fallback for volume growth pairs`);
                 return topVolumePairs;
             } catch (fallbackError) {
@@ -818,7 +999,7 @@ class DexScreenerApi {
         }
     }
     
-    // Comprehensive token discovery using data-driven metrics
+    // Comprehensive token discovery using data-driven metrics and rotating queries
     async discoverTokens() {
         try {
             logger.high('Starting comprehensive Solana token discovery');
@@ -839,23 +1020,23 @@ class DexScreenerApi {
                 discoverySuccess = false;
             }
             
-            // 2. Get top volume pairs
+            // 2. Get high volume tokens
             try {
-                const topVolumePairs = await this.getTopVolumePairs();
-                this.addUniquePairs(allDiscoveredPairs, topVolumePairs);
-                logger.deep(`Added ${this.countNewPairs(topVolumePairs)} new top volume pairs`);
+                const highVolumePairs = await this.getHighVolumeTokens();
+                this.addUniquePairs(allDiscoveredPairs, highVolumePairs);
+                logger.deep(`Added ${this.countNewPairs(highVolumePairs)} new high volume pairs`);
             } catch (error) {
-                logger.error(`Failed to get top volume pairs: ${error.message}`);
+                logger.error(`Failed to get high volume tokens: ${error.message}`);
                 discoverySuccess = false;
             }
             
-            // 3. Get price movement pairs
+            // 3. Get recent tokens
             try {
-                const priceMovementPairs = await this.getPriceMovementPairs();
-                this.addUniquePairs(allDiscoveredPairs, priceMovementPairs);
-                logger.deep(`Added ${this.countNewPairs(priceMovementPairs)} new price movement pairs`);
+                const recentPairs = await this.getRecentTokens();
+                this.addUniquePairs(allDiscoveredPairs, recentPairs);
+                logger.deep(`Added ${this.countNewPairs(recentPairs)} new recent pairs`);
             } catch (error) {
-                logger.error(`Failed to get price movement pairs: ${error.message}`);
+                logger.error(`Failed to get recent tokens: ${error.message}`);
                 discoverySuccess = false;
             }
             
@@ -879,12 +1060,12 @@ class DexScreenerApi {
                 discoverySuccess = false;
             }
             
-            // 6. Get recent pairs from top DEXes
+            // 6. Get pairs from top DEXes
             try {
                 const popularDexes = await this.getPopularDexes();
                 
-                // Limit to top 10 DEXes to save API credits
-                for (const dexId of popularDexes.slice(0, 10)) {
+                // Limit to top 5 DEXes to save API credits
+                for (const dexId of popularDexes.slice(0, 5)) {
                     try {
                         const dexPairs = await this.getPairsFromDex(dexId);
                         
